@@ -1,0 +1,184 @@
+name: Release-α
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published, prereleased]
+
+env:
+  MUSL_VERSION: "1.2.6"
+  ARTIFACT_RETENTION: 1
+
+jobs:
+  prepare-sources:
+    name: Prepare Sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download musl source
+        run: |
+          mkdir -p shared-tarballs
+          curl -fsSL --retry 10 --retry-delay 5 \
+            https://musl.libc.org/releases/musl-${{ env.MUSL_VERSION }}.tar.gz \
+            -o shared-tarballs/musl-${{ env.MUSL_VERSION }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shared-tarballs
+          path: shared-tarballs/
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
+    needs: prepare-sources
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - i586-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - loongarch64-unknown-linux-musl
+          - m68k-unknown-linux-musl
+          - microblazeel-xilinx-linux-musl
+          - microblaze-xilinx-linux-musl
+          - mipsel-unknown-linux-musl
+          - mipsel-unknown-linux-muslsf
+          - mips-unknown-linux-musl
+          - mips-unknown-linux-muslsf
+          - mips64el-unknown-linux-musl
+          - mips64-unknown-linux-musl
+          - or1k-unknown-linux-musl
+          - powerpcle-unknown-linux-musl
+          - powerpc-unknown-linux-musl
+          - powerpc64le-unknown-linux-musl
+          - powerpc64-unknown-linux-musl
+          - riscv32-unknown-linux-musl
+          - riscv64-unknown-linux-musl
+          - s390x-ibm-linux-musl
+          - sh4-multilib-linux-musl
+          - x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shared-tarballs
+          path: shared-tarballs
+
+      - name: Deploy tarballs
+        run: |
+          mkdir -p ~/src .build/tarballs
+          cp shared-tarballs/* ~/src/ 2>/dev/null || true
+          cp shared-tarballs/* .build/tarballs/ 2>/dev/null || true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison bzip2 ca-certificates cmake curl file flex \
+            g++ gawk gdb git gperf help2man libncurses-dev libssl-dev \
+            libtool-bin make patch pkg-config python3 rsync texinfo \
+            unzip wget xz-utils \
+            libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
+            libgmp-static libmpfr-static \
+            zlib1g-dev libzstd-dev
+
+      - name: Build toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+          CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
+        run: |
+          sudo rm -rf /opt/*
+          sudo mkdir -p /opt
+          sudo chmod 0777 /opt
+
+          pushd builder
+          git reset --hard HEAD
+          git clean -fd
+          for patch in ../targets/${TARGET}/*.patch; do
+            [ -f "$patch" ] && patch -Np1 -i "$patch"
+          done
+
+          ./bootstrap
+          ./configure --prefix=/opt/ct-ng
+          make -j$(nproc)
+          sudo make install
+          popd
+
+          rm -rf build
+          mkdir -p build
+          cp targets/${TARGET}/config build/.config
+
+          cat >> build/.config << 'EOF'
+          CT_STATIC_TOOLCHAIN=y
+          CT_CC_GCC_STATIC_LIBSTDCXX=y
+          EOF
+
+          pushd build
+          /opt/ct-ng/bin/ct-ng olddefconfig
+          /opt/ct-ng/bin/ct-ng build
+          popd
+
+          sudo mv /opt/x-tools/${TARGET} .
+          sudo chown -R root:root ${TARGET}
+          sudo tar -cJvf ${TARGET}.tar.xz ${TARGET}
+          sudo sha256sum ${TARGET}.tar.xz | awk '{ print $1 }' > ${TARGET}.tar.xz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}.tar.xz
+          path: ${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}.tar.xz.sha256
+          path: ${{ matrix.target }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-22.04
+    needs: build
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: "*.tar.*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          {
+            echo "| Filename | Sha256sum |"
+            echo "| -------- | --------- |"
+            for f in release/*.sha256; do
+              echo "| $(basename "$f" .sha256) | $(cat "$f") |"
+            done
+          } > RELEASE.md
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          for f in release/*.tar.xz; do
+            gh release upload "$TAG" "$f" "$f.sha256"
+          done
+          gh release edit "$TAG" -F RELEASE.md
