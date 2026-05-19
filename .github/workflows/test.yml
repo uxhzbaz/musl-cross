@@ -1,23 +1,26 @@
-name: Test-microblaze
+name: Release-β-test
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+      release_name:
+        description: 'Release name (e.g. Release 1.0.0)'
+        required: true
+  release:
+    types: [published]
+
+env:
+  MUSL_VERSION: "1.2.6"
+  ARTIFACT_RETENTION: 1
 
 jobs:
-  build:
-    name: Build (microblaze-xilinx-linux-musl)
-    runs-on: ubuntu-24.04-arm
-    env:
-      TARGET: microblaze-xilinx-linux-musl
-      MUSL_VERSION: "1.2.6"
-      CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
-
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          submodules: true
-
       - name: Download sources
         run: |
           mkdir -p shared-tarballs
@@ -27,10 +30,66 @@ jobs:
 
           MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
             | grep -oP '"tag_name":\s*"v\K[^"]+')
-          echo "MOLD_VERSION=${MOLD_VERSION}" >> $GITHUB_ENV
+          echo "MOLD_VERSION=${MOLD_VERSION}" > shared-tarballs/mold.env
           curl -fsSL --retry 5 \
             "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
             -o shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shared-tarballs
+          path: shared-tarballs/
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - i586-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - loongarch64-unknown-linux-musl
+          - m68k-unknown-linux-musl
+          - microblazeel-xilinx-linux-musl
+          - microblaze-xilinx-linux-musl
+          - mipsel-unknown-linux-musl
+          - mipsel-unknown-linux-muslsf
+          - mips-unknown-linux-musl
+          - mips-unknown-linux-muslsf
+          - mips64el-unknown-linux-musl
+          - mips64-unknown-linux-musl
+          - or1k-unknown-linux-musl
+          - powerpcle-unknown-linux-musl
+          - powerpc-unknown-linux-musl
+          - powerpc64le-unknown-linux-musl
+          - powerpc64-unknown-linux-musl
+          - riscv32-unknown-linux-musl
+          - riscv64-unknown-linux-musl
+          - s390x-ibm-linux-musl
+          - sh4-multilib-linux-musl
+          - x86_64-unknown-linux-musl
+    env:
+      TARGET: ${{ matrix.target }}
+      CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shared-tarballs
+          path: shared-tarballs
 
       - name: Deploy tarballs
         run: |
@@ -52,6 +111,7 @@ jobs:
 
       - name: Build static mold
         run: |
+          source shared-tarballs/mold.env
           tar -xf shared-tarballs/mold-${MOLD_VERSION}.tar.gz
           cd mold-${MOLD_VERSION}
           cmake -B build \
@@ -121,9 +181,58 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TARGET }}.tar.xz
-          path: |
-            ${{ env.TARGET }}.tar.xz
-            ${{ env.TARGET }}.tar.xz.sha256
+          name: ${{ matrix.target }}.tar.xz
+          path: ${{ matrix.target }}.tar.xz
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}.tar.xz.sha256
+          path: ${{ matrix.target }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: "*.tar.*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          {
+            echo "| Filename | Sha256sum |"
+            echo "| -------- | --------- |"
+            for f in release/*.sha256; do
+              echo "| $(basename "$f" .sha256) | $(cat "$f") |"
+            done
+          } > RELEASE.md
+
+      - name: Create or use release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            NAME="${{ github.event.inputs.release_name }}"
+            gh release create "${TAG}" \
+              --title "${NAME}" \
+              --notes-file RELEASE.md
+          else
+            TAG="${{ github.event.release.tag_name }}"
+            gh release edit "${TAG}" -F RELEASE.md
+          fi
+
+          for f in release/*.tar.xz; do
+            gh release upload "${TAG}" "$f" "$f.sha256"
+          done
