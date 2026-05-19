@@ -151,10 +151,13 @@ jobs:
       - name: Replace mold with static binary
         run: |
           MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f 2>/dev/null | head -1)
-          [ -z "${MOLD_BIN}" ] && { echo "mold not found, skipping"; exit 0; }
-          echo "Replacing: ${MOLD_BIN}"
-          sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
-          file "${MOLD_BIN}"
+          if [ -z "${MOLD_BIN}" ]; then
+            echo "mold not found, skipping"
+          else
+            echo "Replacing: ${MOLD_BIN}"
+            sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
+            file "${MOLD_BIN}"
+          fi
 
       - name: Strip debug symbols
         run: |
