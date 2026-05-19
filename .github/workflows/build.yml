@@ -3,38 +3,43 @@ name: Release-β
 on:
   workflow_dispatch:
   release:
-    types:
-      - published
+    types: [published]
+
+env:
+  MUSL_VERSION: "1.2.6"
+  ARTIFACT_RETENTION: 1
 
 jobs:
-  # ==========================================
-  # 新增：前置源码准备任务
-  # ==========================================
-  prepare-sources:
-    name: Prepare Sources
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
     steps:
       - name: Download musl source
         run: |
           mkdir -p shared-tarballs
-          echo "Downloading musl-1.2.6.tar.gz..."
-          # 增加重试机制下载一次 musl 源码
-          curl -fsSL --retry 10 --retry-delay 5 https://musl.libc.org/releases/musl-1.2.6.tar.gz -o shared-tarballs/musl-1.2.6.tar.gz
-          
-          # 提示：如果未来遇到 gcc, binutils 等其他包并发下载失败，也可直接在这里追加 curl 下载命令
-          # curl -fsSL --retry 10 ... -o shared-tarballs/gcc-x.y.z.tar.xz
+          curl -fsSL --retry 10 --retry-delay 5 \
+            https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz \
+            -o shared-tarballs/musl-${MUSL_VERSION}.tar.gz
 
-      - name: Upload sources artifact
-        uses: actions/upload-artifact@v4
+      - name: Get mold version
+        run: |
+          MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
+            | grep -oP '"tag_name":\s*"v\K[^"]+')
+          echo "MOLD_VERSION=${MOLD_VERSION}" > shared-tarballs/mold.env
+          curl -fsSL --retry 5 \
+            "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
+            -o shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+
+      - uses: actions/upload-artifact@v4
         with:
           name: shared-tarballs
           path: shared-tarballs/
-          retention-days: 1 # 仅在本次工作流运行期间短暂停留即可
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-24.04-arm
-    needs: prepare-sources # 强依赖：等待源码下载完成才开始矩阵构建
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -66,87 +71,155 @@ jobs:
           - s390x-ibm-linux-musl
           - sh4-multilib-linux-musl
           - x86_64-unknown-linux-musl
+    env:
+      TARGET: ${{ matrix.target }}
+      CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
           submodules: true
 
-      # ==========================================
-      # 新增：拉取共享源码并部署到 ct-ng 可以识别的位置
-      # ==========================================
-      - name: Download shared sources
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: shared-tarballs
           path: shared-tarballs
 
-      - name: Setup local tarballs directory
+      - name: Deploy tarballs
         run: |
-          # crosstool-NG 默认通常会在用户目录下的 src 找预下载的压缩包
-          mkdir -p ~/src
-          cp shared-tarballs/* ~/src/ 2>/dev/null || true
-          
-          # 双重保障：也放到当前工作区的默认缓存路径中
-          mkdir -p .build/tarballs
-          cp shared-tarballs/* .build/tarballs/ 2>/dev/null || true
+          mkdir -p ~/src .build/tarballs
+          cp shared-tarballs/musl-*.tar.gz ~/src/
+          cp shared-tarballs/musl-*.tar.gz .build/tarballs/
 
-      - name: Build
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison bzip2 ca-certificates cmake curl file flex \
+            g++ gawk gdb git gperf help2man libncurses-dev libssl-dev \
+            libtool-bin make patch pkg-config python3 rsync texinfo \
+            unzip wget xz-utils \
+            libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
+            zlib1g-dev libzstd-dev \
+            clang libstdc++-12-dev
+
+      - name: Build static mold
+        run: |
+          source shared-tarballs/mold.env
+          tar -xf shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+
+          cd mold-${MOLD_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DMOLD_MOSTLY_STATIC=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_INSTALL_PREFIX=/tmp/mold-static
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+          file /tmp/mold-static/bin/mold
+
+      - name: Build toolchain
         run: |
           sudo rm -rf /opt/*
-          
-          # 通过显式导出环境变量，强制 crosstool-NG 优先使用我们注入的本地源码包目录
-          export CT_LOCAL_TARBALLS_DIR="${GITHUB_WORKSPACE}/shared-tarballs"
-          
-          ./scripts/make ${{ matrix.target }}
+          sudo mkdir -p /opt
+          sudo chmod 0777 /opt
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+          pushd builder
+          git reset --hard HEAD
+          git clean -fd
+          for patch in ../targets/${TARGET}/*.patch; do
+            [ -f "$patch" ] && patch -Np1 -i "$patch"
+          done
+          ./bootstrap
+          ./configure --prefix=/opt/ct-ng
+          make -j$(nproc)
+          sudo make install
+          popd
+
+          rm -rf build
+          mkdir -p build
+          cp targets/${TARGET}/config build/.config
+          printf '\nCT_STATIC_TOOLCHAIN=y\nCT_CC_GCC_STATIC_LIBSTDCXX=y\n' >> build/.config
+
+          pushd build
+          /opt/ct-ng/bin/ct-ng olddefconfig
+          /opt/ct-ng/bin/ct-ng build
+          popd
+
+      - name: Replace mold with static binary
+        run: |
+          MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f | head -1)
+          echo "Replacing: ${MOLD_BIN}"
+          sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
+          file "${MOLD_BIN}"
+
+      - name: Strip debug symbols
+        run: |
+          find /opt/x-tools/${TARGET} -type f | while read f; do
+            case $(file -b "$f") in
+              ELF*static*not\ stripped)
+                sudo strip --strip-debug "$f" && echo "stripped: $f"
+                ;;
+            esac
+          done
+
+      - name: Package
+        run: |
+          sudo mv /opt/x-tools/${TARGET} .
+          sudo chown -R root:root ${TARGET}
+          sudo tar -cJvf ${TARGET}.tar.xz ${TARGET}
+          sudo sha256sum ${TARGET}.tar.xz | awk '{ print $1 }' > ${TARGET}.tar.xz.sha256
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}.tar.xz
           path: ${{ matrix.target }}.tar.xz
           if-no-files-found: error
-          retention-days: 1
-          
-      - name: Upload checksum
-        uses: actions/upload-artifact@v4
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}.tar.xz.sha256
           path: ${{ matrix.target }}.tar.xz.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
 
   release:
     name: Release
     runs-on: ubuntu-22.04
-    needs:
-      - build
+    needs: build
     if: github.event_name == 'release'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+
+      - uses: actions/download-artifact@v4
         with:
           path: release
-          # 仅匹配 .tar.xz 及其 sha256 产物，这也会忽略掉名为 shared-tarballs 的前置源码 artifact
           pattern: "*.tar.*"
           merge-multiple: true
+
       - name: Generate checksums
         run: |
-          echo "| Filename | Sha256sum |" > RELEASE.md
-          echo "| -------- | --------- |" >> RELEASE.md
-          for i in release/*.sha256; do
-            echo "| $(basename $i .sha256) | $(cat $i) |" >> RELEASE.md
-          done
-      - name: Upload artifacts
+          {
+            echo "| Filename | Sha256sum |"
+            echo "| -------- | --------- |"
+            for f in release/*.sha256; do
+              echo "| $(basename "$f" .sha256) | $(cat "$f") |"
+            done
+          } > RELEASE.md
+
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          for i in release/*.tar.xz; do
-            gh release upload ${{ github.event.release.tag_name }} $i $i.sha256
+          for f in release/*.tar.xz; do
+            gh release upload "$TAG" "$f" "$f.sha256"
           done
-          gh release edit ${{ github.event.release.tag_name }} -F RELEASE.md
+          gh release edit "$TAG" -F RELEASE.md
