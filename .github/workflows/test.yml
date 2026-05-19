@@ -1,14 +1,14 @@
-name: Test-Static-Mold
+name: Test-microblaze
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build (aarch64-unknown-linux-musl)
+    name: Build (microblaze-xilinx-linux-musl)
     runs-on: ubuntu-24.04-arm
     env:
-      TARGET: aarch64-unknown-linux-musl
+      TARGET: microblaze-xilinx-linux-musl
       MUSL_VERSION: "1.2.6"
       CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
 
@@ -18,18 +18,25 @@ jobs:
           fetch-depth: 1
           submodules: true
 
-      - name: Download musl source
+      - name: Download sources
         run: |
           mkdir -p shared-tarballs
           curl -fsSL --retry 10 --retry-delay 5 \
             https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz \
             -o shared-tarballs/musl-${MUSL_VERSION}.tar.gz
 
+          MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
+            | grep -oP '"tag_name":\s*"v\K[^"]+')
+          echo "MOLD_VERSION=${MOLD_VERSION}" >> $GITHUB_ENV
+          curl -fsSL --retry 5 \
+            "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
+            -o shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+
       - name: Deploy tarballs
         run: |
           mkdir -p ~/src .build/tarballs
-          cp shared-tarballs/* ~/src/
-          cp shared-tarballs/* .build/tarballs/
+          cp shared-tarballs/musl-*.tar.gz ~/src/
+          cp shared-tarballs/musl-*.tar.gz .build/tarballs/
 
       - name: Install dependencies
         run: |
@@ -45,14 +52,7 @@ jobs:
 
       - name: Build static mold
         run: |
-          MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
-            | grep -oP '"tag_name":\s*"v\K[^"]+')
-          echo "MOLD_VERSION=${MOLD_VERSION}" >> $GITHUB_ENV
-
-          curl -fsSL --retry 5 \
-            "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
-            | tar -xz
-
+          tar -xf shared-tarballs/mold-${MOLD_VERSION}.tar.gz
           cd mold-${MOLD_VERSION}
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -63,8 +63,6 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=/tmp/mold-static
           cmake --build build -j$(nproc)
           cmake --install build
-
-          echo "--- mold binary info ---"
           file /tmp/mold-static/bin/mold
 
       - name: Build toolchain
@@ -95,13 +93,24 @@ jobs:
           /opt/ct-ng/bin/ct-ng build
           popd
 
-      - name: Replace mold with static binary
+          MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f 2>/dev/null | head -1)
+          if [ -n "${MOLD_BIN}" ]; then
+            echo "Replacing mold: ${MOLD_BIN}"
+            sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
+            file "${MOLD_BIN}"
+          else
+            echo "mold not found in ${TARGET}, skipping"
+          fi
+
+      - name: Strip debug symbols
         run: |
-          MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f | head -1)
-          echo "Replacing: ${MOLD_BIN}"
-          sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
-          echo "--- verification ---"
-          file "${MOLD_BIN}"
+          find /opt/x-tools/${TARGET} -type f | while read f; do
+            case $(file -b "$f") in
+              ELF*static*not\ stripped)
+                sudo strip --strip-debug "$f" && echo "stripped: $f"
+                ;;
+            esac
+          done
 
       - name: Package
         run: |
@@ -117,3 +126,4 @@ jobs:
             ${{ env.TARGET }}.tar.xz
             ${{ env.TARGET }}.tar.xz.sha256
           if-no-files-found: error
+          retention-days: 1
