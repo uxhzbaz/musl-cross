@@ -3,7 +3,7 @@ name: Release-β
 on:
   workflow_dispatch:
   release:
-    types: [published, prereleased]
+    types: [published]
 
 env:
   MUSL_VERSION: "1.2.6"
