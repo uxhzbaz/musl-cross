@@ -14,15 +14,13 @@ jobs:
     name: Prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Download musl source
+      - name: Download sources
         run: |
           mkdir -p shared-tarballs
           curl -fsSL --retry 10 --retry-delay 5 \
             https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz \
             -o shared-tarballs/musl-${MUSL_VERSION}.tar.gz
 
-      - name: Get mold version
-        run: |
           MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
             | grep -oP '"tag_name":\s*"v\K[^"]+')
           echo "MOLD_VERSION=${MOLD_VERSION}" > shared-tarballs/mold.env
