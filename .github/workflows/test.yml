@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.0.0)'
+        description: '发布标签🏷 (例如 v1.0.0)'
         required: true
       release_name:
-        description: 'Release name (e.g. Release 1.0.0)'
+        description: '发布名称 (例如 1.0.0)'
         required: true
   release:
     types: [published]
