@@ -40,7 +40,32 @@ jobs:
             libtool-bin make patch pkg-config python3 rsync texinfo \
             unzip wget xz-utils \
             libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
-            zlib1g-dev libzstd-dev
+            zlib1g-dev libzstd-dev \
+            clang libstdc++-12-dev
+
+      - name: Build static mold
+        run: |
+          MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
+            | grep -oP '"tag_name":\s*"v\K[^"]+')
+          echo "MOLD_VERSION=${MOLD_VERSION}" >> $GITHUB_ENV
+
+          curl -fsSL --retry 5 \
+            "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
+            | tar -xz
+
+          cd mold-${MOLD_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DMOLD_MOSTLY_STATIC=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_INSTALL_PREFIX=/tmp/mold-static
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+          echo "--- mold binary info ---"
+          file /tmp/mold-static/bin/mold
 
       - name: Build toolchain
         run: |
@@ -63,7 +88,6 @@ jobs:
           rm -rf build
           mkdir -p build
           cp targets/${TARGET}/config build/.config
-
           printf '\nCT_STATIC_TOOLCHAIN=y\nCT_CC_GCC_STATIC_LIBSTDCXX=y\n' >> build/.config
 
           pushd build
@@ -71,10 +95,12 @@ jobs:
           /opt/ct-ng/bin/ct-ng build
           popd
 
-      - name: Check mold linkage
+      - name: Replace mold with static binary
         run: |
           MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f | head -1)
-          echo "mold path: ${MOLD_BIN}"
+          echo "Replacing: ${MOLD_BIN}"
+          sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
+          echo "--- verification ---"
           file "${MOLD_BIN}"
 
       - name: Package
