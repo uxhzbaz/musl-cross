@@ -153,6 +153,10 @@ jobs:
       - name: Replace mold with static binary
         run: |
           MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f | head -1)
+          if [ -z "${MOLD_BIN}" ]; then
+            echo "mold not found in toolchain, skipping"
+            exit 0
+          fi
           echo "Replacing: ${MOLD_BIN}"
           sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
           file "${MOLD_BIN}"
