@@ -35,19 +35,24 @@ jobs:
             "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
             -o shared-tarballs/mold-${MOLD_VERSION}.tar.gz
 
-      - name: Patch musl (drop faccessat2 to avoid Android seccomp SIGSYS)
+      - name: Patch musl (drop faccessat2/statx to avoid Android seccomp SIGSYS)
         run: |
           mkdir -p musl-patch-root
           tar -xf shared-tarballs/musl-${MUSL_VERSION}.tar.gz -C musl-patch-root
-          # 此时目录结构为 musl-patch-root/musl-${MUSL_VERSION}/...
+          
+          # 直接替换 .c 源码中的系统调用为 -ENOSYS
+          # 将: int ret = __syscall(SYS_faccessat2, fd, filename, amode, flag);
+          # 变为: int ret = -ENOSYS;
+          # 借此完美触发 musl 内部原本的 fallback 逻辑，同时避免未定义宏报错。
+          sed -i 's/__syscall(SYS_faccessat2[^)]*)/-ENOSYS/g' "musl-patch-root/musl-${MUSL_VERSION}/src/unistd/faccessat.c"
 
-          find "musl-patch-root/musl-${MUSL_VERSION}/arch" -name 'syscall.h.in' -print0 | \
-            xargs -0 sed -i '/#define[[:space:]]\+__NR_faccessat2[[:space:]]/d'
-
-          if grep -rl '__NR_faccessat2' "musl-patch-root/musl-${MUSL_VERSION}/arch"; then
+          if grep -q 'SYS_faccessat2' "musl-patch-root/musl-${MUSL_VERSION}/src/unistd/faccessat.c"; then
             echo "::error::faccessat2 patch 未生效"
             exit 1
           fi
+
+          # 同理，针对 fstatat.c 中的 statx 规避 SIGSYS
+          sed -i 's/__syscall(SYS_statx[^)]*)/-ENOSYS/g' "musl-patch-root/musl-${MUSL_VERSION}/src/stat/fstatat.c"
 
           # 保留原始顶层目录名重新打包，确保 crosstool-NG 解压后目录结构不变
           tar -C musl-patch-root -czf "shared-tarballs/musl-${MUSL_VERSION}.tar.gz" "musl-${MUSL_VERSION}"
@@ -67,10 +72,8 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - x86_64-unknown-linux-musl
+          # 只保留 aarch64 架构
           - aarch64-unknown-linux-musl
-          - i686-unknown-linux-musl
-          - arm-unknown-linux-musleabi
     env:
       TARGET: ${{ matrix.target }}
       CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
