@@ -2,6 +2,13 @@ name: Release-α
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签🏷 (例如 v1.0.0)'
+        required: true
+      release_name:
+        description: '发布名称 (例如 1.0.0)'
+        required: true
   release:
     types: [published]
 
@@ -10,16 +17,44 @@ env:
   ARTIFACT_RETENTION: 1
 
 jobs:
-  prepare-sources:
-    name: Prepare Sources
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Download musl source
+      - name: Download sources
         run: |
           mkdir -p shared-tarballs
           curl -fsSL --retry 10 --retry-delay 5 \
-            https://musl.libc.org/releases/musl-${{ env.MUSL_VERSION }}.tar.gz \
-            -o shared-tarballs/musl-${{ env.MUSL_VERSION }}.tar.gz
+            https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz \
+            -o shared-tarballs/musl-${MUSL_VERSION}.tar.gz
+
+          MOLD_VERSION=$(curl -fsSL https://api.github.com/repos/rui314/mold/releases/latest \
+            | grep -oP '"tag_name":\s*"v\K[^"]+')
+          echo "MOLD_VERSION=${MOLD_VERSION}" > shared-tarballs/mold.env
+          curl -fsSL --retry 5 \
+            "https://github.com/rui314/mold/archive/refs/tags/v${MOLD_VERSION}.tar.gz" \
+            -o shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+
+      - name: Patch musl (drop faccessat2 to avoid Android seccomp SIGSYS)
+        run: |
+          mkdir -p musl-src
+          tar -xf shared-tarballs/musl-${MUSL_VERSION}.tar.gz -C musl-src --strip-components=1
+
+          # 在所有架构的 syscall 头文件中移除 __NR_faccessat2 定义
+          # 这样 musl 编译时 #ifdef SYS_faccessat2 分支不会生效，
+          # access()/faccessat() 会直接走老的 faccessat/access 系统调用，
+          # 不再触发 Android seccomp 对未知 syscall 439 发送 SIGSYS 杀进程的问题
+          find musl-src/arch -name 'syscall.h.in' -print0 | \
+            xargs -0 sed -i '/#define[[:space:]]\+__NR_faccessat2[[:space:]]/d'
+
+          # 验证：确认已经全部清除
+          if grep -rl '__NR_faccessat2' musl-src/arch; then
+            echo "::error::faccessat2 patch 未生效"
+            exit 1
+          fi
+
+          tar -C musl-src -czf "shared-tarballs/musl-${MUSL_VERSION}.tar.gz" .
+          echo "已重新打包 patched musl-${MUSL_VERSION}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -30,38 +65,18 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-24.04-arm
-    needs: prepare-sources
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
         target:
-          - aarch64-unknown-linux-musl
-          - arm-unknown-linux-musleabi
-          - arm-unknown-linux-musleabihf
-          - armv7-unknown-linux-musleabi
-          - armv7-unknown-linux-musleabihf
-          - i586-unknown-linux-musl
-          - i686-unknown-linux-musl
-          - loongarch64-unknown-linux-musl
-          - m68k-unknown-linux-musl
-          - microblazeel-xilinx-linux-musl
-          - microblaze-xilinx-linux-musl
-          - mipsel-unknown-linux-musl
-          - mipsel-unknown-linux-muslsf
-          - mips-unknown-linux-musl
-          - mips-unknown-linux-muslsf
-          - mips64el-unknown-linux-musl
-          - mips64-unknown-linux-musl
-          - or1k-unknown-linux-musl
-          - powerpcle-unknown-linux-musl
-          - powerpc-unknown-linux-musl
-          - powerpc64le-unknown-linux-musl
-          - powerpc64-unknown-linux-musl
-          - riscv32-unknown-linux-musl
-          - riscv64-unknown-linux-musl
-          - s390x-ibm-linux-musl
-          - sh4-multilib-linux-musl
           - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+    env:
+      TARGET: ${{ matrix.target }}
+      CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
 
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +92,8 @@ jobs:
       - name: Deploy tarballs
         run: |
           mkdir -p ~/src .build/tarballs
-          cp shared-tarballs/* ~/src/ 2>/dev/null || true
-          cp shared-tarballs/* .build/tarballs/ 2>/dev/null || true
+          cp shared-tarballs/musl-*.tar.gz ~/src/
+          cp shared-tarballs/musl-*.tar.gz .build/tarballs/
 
       - name: Install dependencies
         run: |
@@ -89,12 +104,26 @@ jobs:
             libtool-bin make patch pkg-config python3 rsync texinfo \
             unzip wget xz-utils \
             libgmp-dev libmpfr-dev libmpc-dev libisl-dev \
-            zlib1g-dev libzstd-dev
+            zlib1g-dev libzstd-dev \
+            clang libstdc++-12-dev
+
+      - name: Build static mold
+        run: |
+          source shared-tarballs/mold.env
+          tar -xf shared-tarballs/mold-${MOLD_VERSION}.tar.gz
+          cd mold-${MOLD_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DMOLD_MOSTLY_STATIC=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_INSTALL_PREFIX=/tmp/mold-static
+          cmake --build build -j$(nproc)
+          cmake --install build
+          file /tmp/mold-static/bin/mold
 
       - name: Build toolchain
-        env:
-          TARGET: ${{ matrix.target }}
-          CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
         run: |
           sudo rm -rf /opt/*
           sudo mkdir -p /opt
@@ -106,7 +135,6 @@ jobs:
           for patch in ../targets/${TARGET}/*.patch; do
             [ -f "$patch" ] && patch -Np1 -i "$patch"
           done
-
           ./bootstrap
           ./configure --prefix=/opt/ct-ng
           make -j$(nproc)
@@ -116,17 +144,34 @@ jobs:
           rm -rf build
           mkdir -p build
           cp targets/${TARGET}/config build/.config
-
-          cat >> build/.config << 'EOF'
-          CT_STATIC_TOOLCHAIN=y
-          CT_CC_GCC_STATIC_LIBSTDCXX=y
-          EOF
+          printf '\nCT_STATIC_TOOLCHAIN=y\nCT_CC_GCC_STATIC_LIBSTDCXX=y\n' >> build/.config
 
           pushd build
           /opt/ct-ng/bin/ct-ng olddefconfig
           /opt/ct-ng/bin/ct-ng build
           popd
 
+          MOLD_BIN=$(find /opt/x-tools/${TARGET} -name "mold" -type f 2>/dev/null | head -1)
+          if [ -n "${MOLD_BIN}" ]; then
+            echo "Replacing mold: ${MOLD_BIN}"
+            sudo cp /tmp/mold-static/bin/mold "${MOLD_BIN}"
+            file "${MOLD_BIN}"
+          else
+            echo "mold not found in ${TARGET}, skipping"
+          fi
+
+      - name: Strip debug symbols
+        run: |
+          find /opt/x-tools/${TARGET} -type f | while read f; do
+            case $(file -b "$f") in
+              ELF*static*not\ stripped)
+                sudo strip --strip-debug "$f" && echo "stripped: $f"
+                ;;
+            esac
+          done
+
+      - name: Package
+        run: |
           sudo mv /opt/x-tools/${TARGET} .
           sudo chown -R root:root ${TARGET}
           sudo tar -cJvf ${TARGET}.tar.xz ${TARGET}
@@ -150,7 +195,6 @@ jobs:
     name: Release
     runs-on: ubuntu-22.04
     needs: build
-    if: github.event_name == 'release'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -172,12 +216,21 @@ jobs:
             done
           } > RELEASE.md
 
-      - name: Upload release assets
+      - name: Create or use release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            NAME="${{ github.event.inputs.release_name }}"
+            gh release create "${TAG}" \
+              --title "${NAME}" \
+              --notes-file RELEASE.md
+          else
+            TAG="${{ github.event.release.tag_name }}"
+            gh release edit "${TAG}" -F RELEASE.md
+          fi
+
           for f in release/*.tar.xz; do
-            gh release upload "$TAG" "$f" "$f.sha256"
+            gh release upload "${TAG}" "$f" "$f.sha256"
           done
-          gh release edit "$TAG" -F RELEASE.md
