@@ -37,23 +37,20 @@ jobs:
 
       - name: Patch musl (drop faccessat2 to avoid Android seccomp SIGSYS)
         run: |
-          mkdir -p musl-src
-          tar -xf shared-tarballs/musl-${MUSL_VERSION}.tar.gz -C musl-src --strip-components=1
+          mkdir -p musl-patch-root
+          tar -xf shared-tarballs/musl-${MUSL_VERSION}.tar.gz -C musl-patch-root
+          # 此时目录结构为 musl-patch-root/musl-${MUSL_VERSION}/...
 
-          # 在所有架构的 syscall 头文件中移除 __NR_faccessat2 定义
-          # 这样 musl 编译时 #ifdef SYS_faccessat2 分支不会生效，
-          # access()/faccessat() 会直接走老的 faccessat/access 系统调用，
-          # 不再触发 Android seccomp 对未知 syscall 439 发送 SIGSYS 杀进程的问题
-          find musl-src/arch -name 'syscall.h.in' -print0 | \
+          find "musl-patch-root/musl-${MUSL_VERSION}/arch" -name 'syscall.h.in' -print0 | \
             xargs -0 sed -i '/#define[[:space:]]\+__NR_faccessat2[[:space:]]/d'
 
-          # 验证：确认已经全部清除
-          if grep -rl '__NR_faccessat2' musl-src/arch; then
+          if grep -rl '__NR_faccessat2' "musl-patch-root/musl-${MUSL_VERSION}/arch"; then
             echo "::error::faccessat2 patch 未生效"
             exit 1
           fi
 
-          tar -C musl-src -czf "shared-tarballs/musl-${MUSL_VERSION}.tar.gz" .
+          # 保留原始顶层目录名重新打包，确保 crosstool-NG 解压后目录结构不变
+          tar -C musl-patch-root -czf "shared-tarballs/musl-${MUSL_VERSION}.tar.gz" "musl-${MUSL_VERSION}"
           echo "已重新打包 patched musl-${MUSL_VERSION}.tar.gz"
 
       - uses: actions/upload-artifact@v4
@@ -64,7 +61,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     needs: prepare
     strategy:
       fail-fast: false
