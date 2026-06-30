@@ -41,8 +41,6 @@ jobs:
           tar -xf shared-tarballs/musl-${MUSL_VERSION}.tar.gz -C musl-patch-root
           
           # 直接替换 .c 源码中的系统调用为 -ENOSYS
-          # 将: int ret = __syscall(SYS_faccessat2, fd, filename, amode, flag);
-          # 变为: int ret = -ENOSYS;
           # 借此完美触发 musl 内部原本的 fallback 逻辑，同时避免未定义宏报错。
           sed -i 's/__syscall(SYS_faccessat2[^)]*)/-ENOSYS/g' "musl-patch-root/musl-${MUSL_VERSION}/src/unistd/faccessat.c"
 
@@ -71,9 +69,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 在这里配置你需要编译的所有架构工具链
         target:
-          # 只保留 aarch64 架构
+          - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - arm-unknown-linux-musleabi
     env:
       TARGET: ${{ matrix.target }}
       CT_LOCAL_TARBALLS_DIR: ${{ github.workspace }}/shared-tarballs
